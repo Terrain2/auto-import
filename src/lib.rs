@@ -3,7 +3,7 @@
 use json::JsonValue;
 use proc_macro::TokenStream;
 use std::collections::{HashMap, HashSet};
-use std::process::{self, Command};
+use std::process::Command;
 use std::str::FromStr;
 
 #[proc_macro]
@@ -104,7 +104,7 @@ pub fn magic(input: TokenStream) -> TokenStream {
             .output()
             .unwrap();
         if out.status.success() {
-            process::exit(0);
+            break;
         }
         for line in std::str::from_utf8(&out.stderr)
             .unwrap()
@@ -137,26 +137,26 @@ pub fn magic(input: TokenStream) -> TokenStream {
             }
         }
 
-        if more_imports.len() > 1 {
-            let mut idents: HashMap<String, Vec<String>> = HashMap::new();
-            for suggestion in more_imports.drain() {
-                let ident = suggestion.split("::").last().unwrap();
-                let suggestions_for_ident = idents.entry(ident.to_string()).or_default();
-                suggestions_for_ident.push(suggestion);
-            }
-            for (ident, suggestions) in idents {
-                let (best, exclude) = disambiguate(ident, suggestions);
-                println!("\x1b[1;32m   Injecting\x1b[m {best}");
-                imports.insert(best);
-                for bad in exclude {
-                    excluded.insert(bad);
-                }
-            }
-        } else if more_imports.len() == 1 {
-            imports.extend(more_imports.drain());
-        } else {
+        if more_imports.is_empty() {
             break;
         }
+
+        let mut idents: HashMap<String, Vec<String>> = HashMap::new();
+        for suggestion in more_imports.drain().chain(imports.drain()) {
+            let ident = suggestion.split("::").last().unwrap();
+            let suggestions_for_ident = idents.entry(ident.to_string()).or_default();
+            suggestions_for_ident.push(suggestion);
+        }
+        for (ident, suggestions) in idents {
+            let (best, exclude) = disambiguate(ident, suggestions);
+            imports.insert(best);
+            for bad in exclude {
+                excluded.insert(bad);
+            }
+        }
+    }
+    for import in &imports {
+        println!("\x1b[1;32m   Injecting\x1b[m use {import};");
     }
     TokenStream::from_str(
         &imports
@@ -261,8 +261,8 @@ fn disambiguate(ident: String, mut suggestions: Vec<String>) -> (String, Vec<Str
         println!("\x1b[1;31m            \x1b[m {suggestion}");
     }
 
-    println!("\x1b[1;31m  Don't know\x1b[m which is best");
     println!("\x1b[1;32m     Picking\x1b[m at random");
+    println!("\x1b[1;32m      Hoping\x1b[m for the best");
     let index = (0..suggestions.len()).choose(&mut thread_rng()).unwrap();
     let result = suggestions.swap_remove(index);
     return (result, suggestions);
