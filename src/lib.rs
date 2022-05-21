@@ -1,12 +1,10 @@
-#![feature(proc_macro_span)]
+#![cfg_attr(not(feature = "stable"), feature(proc_macro_span))]
 
 use json::JsonValue;
-use lazy_static::lazy_static;
-use proc_macro::{Span, TokenStream};
+use proc_macro::TokenStream;
 use std::collections::{HashMap, HashSet};
-use std::process;
+use std::process::{self, Command};
 use std::str::FromStr;
-use std::sync::Mutex;
 
 #[proc_macro]
 pub fn magic(input: TokenStream) -> TokenStream {
@@ -15,45 +13,70 @@ pub fn magic(input: TokenStream) -> TokenStream {
         "auto_import::magic!() takes no arguments!"
     );
 
-    let file = Span::call_site().source_file();
-    if !file.is_real() {
-        // I don't know why this would ever be false or what a fake file even means, so don't handle it
-        return input;
-    }
+    #[cfg(feature = "stable")]
+    let key = {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        if ONCE.swap(true, Relaxed) {
+            panic!("don't call `magic_import::magic!();` more than once per crate! (try using nightly?)");
+        }
+        if let Ok(imports) = std::env::var("autoimport") {
+            return TokenStream::from_str(&imports).unwrap();
+        }
+        "autoimport"
+    };
 
-    // JSON output contains paths which ig is UTF-8 too. not quite sure what that's about.
-    // i think this'll panic with non-UTF8 stuff because of that, so therefore i assume valid UTF-8
-    let file = file.path();
-    let file = file.to_str().expect("valid UTF-8");
+    // need to keep file, key at the outermost scope for refs to live long enough
+    #[cfg(not(feature = "stable"))]
+    let file = {
+        use proc_macro::Span;
+        let file = Span::call_site().source_file();
+        if !file.is_real() {
+            // I don't know why this would ever be false or what a fake file even means, so don't handle it
+            return input;
+        }
 
-    // uhh idk what's valid in env vars, from a quick google search it seems just alphanumeric and _ so better safe than sorry
-    let custom_key: String = "autoimport_"
-        .chars()
-        .chain(file.chars().filter(char::is_ascii_alphanumeric))
-        .collect();
-    let custom_key = custom_key.as_str();
+        // JSON output contains paths which ig is UTF-8 too. not quite sure what that's about.
+        // i think this'll panic with non-UTF8 stuff because of that, so therefore i assume valid UTF-8
+        file.path()
+            .into_os_string()
+            .into_string()
+            .expect("valid UTF-8")
+    };
 
-    if let Ok(x) = std::env::var(custom_key) {
-        return TokenStream::from_str(&x).unwrap();
-    }
+    #[cfg(not(feature = "stable"))]
+    let key: String = {
+        // uhh idk what's valid in env vars, from a quick google search it seems just alphanumeric and _ so better safe than sorry
+        "autoimport_"
+            .chars()
+            .chain(file.chars().filter(char::is_ascii_alphanumeric))
+            .collect()
+    };
 
-    // autoimport launched this process to check for errors, but this is NOT the correct invocation of the macro
-    if let Ok(_) = std::env::var("autoimport") {
-        return input;
-    }
-
-    lazy_static! {
-        static ref ONCE: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
-    }
-
-    {
+    #[cfg(not(feature = "stable"))]
+    let key: &str = {
+        use std::sync::Mutex;
+        lazy_static::lazy_static! {
+            static ref ONCE: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+        }
         let mut files = ONCE.lock().unwrap();
-        if files.contains(custom_key) {
+        if files.contains(&key) {
             // this poisons future invocations but uh, i guess that just prevents extra resources from being used for invalid invocations
             panic!("don't call auto_import::magic!() more than once per file!");
         }
-        files.insert(custom_key.to_string());
-    }
+        files.insert(key.to_string());
+
+        if let Ok(imports) = std::env::var(&key) {
+            return TokenStream::from_str(&imports).unwrap();
+        }
+
+        // autoimport launched this process to check for errors, but this is NOT the correct invocation of the macro
+        if let Ok(_) = std::env::var("autoimport") {
+            return input;
+        }
+
+        &key
+    };
 
     let mut imports = HashSet::<String>::new();
     let mut more_imports = HashSet::<String>::new();
@@ -61,20 +84,23 @@ pub fn magic(input: TokenStream) -> TokenStream {
 
     for _ in 0..10 {
         let mut args = std::env::args_os();
-        let out = process::Command::new(args.next().unwrap())
+        let out = Command::new(args.next().unwrap())
             .args(args.filter(|arg| {
                 arg.to_str()
                     .map_or(true, |s| !s.starts_with("--error-format="))
             }))
             .arg("--error-format=json")
-            .env("autoimport", "YES_SO_DONT_EVEN_TRY_ANYTHING")
-            .env(
-                custom_key,
-                imports
-                    .iter()
-                    .flat_map(|s| ["use ", s, ";"])
-                    .collect::<String>(),
-            )
+            .envs([
+                #[cfg(not(feature = "stable"))]
+                ("autoimport", "YES_SO_DONT_EVEN_TRY_ANYTHING"),
+                (
+                    key,
+                    &imports
+                        .iter()
+                        .flat_map(|s| ["use ", s, ";"])
+                        .collect::<String>(),
+                ),
+            ])
             .output()
             .unwrap();
         if out.status.success() {
@@ -86,17 +112,20 @@ pub fn magic(input: TokenStream) -> TokenStream {
             .filter(|l| l.starts_with('{'))
         {
             if let Ok(json) = json::parse(line) {
-                if json["children"].members().chain([&json]).any(|c| {
-                    c["spans"].members().any(|span| {
-                        // assert_eq will contain "similarly named macro `assert` defined here"
-                        // with "is_primary": false, so therefore only check path for the
-                        span["is_primary"].as_bool().unwrap_or(false)
-                            && span["file_name"]
-                                .as_str()
-                                .map_or(false, |error_file| error_file != file)
-                    })
-                }) {
-                    continue;
+                #[cfg(not(feature = "stable"))]
+                {
+                    if json["children"].members().chain([&json]).any(|c| {
+                        c["spans"].members().any(|span| {
+                            // assert_eq will contain "similarly named macro `assert` defined here"
+                            // with "is_primary": false, so therefore only check path for the
+                            span["is_primary"].as_bool().unwrap_or(false)
+                                && span["file_name"]
+                                    .as_str()
+                                    .map_or(false, |error_file| error_file != file)
+                        })
+                    }) {
+                        continue;
+                    }
                 }
                 more_imports.extend(
                     error(&json)
@@ -184,17 +213,16 @@ fn disambiguate(ident: String, mut suggestions: Vec<String>) -> (String, Vec<Str
     }
     for i in 0..(suggestions.len() - 1) {
         for j in (i + 1)..suggestions.len() {
-            if std_and_core(&ident, &suggestions[i], &suggestions[j]) {
+            if std_and_core(&suggestions[i], &suggestions[j]) {
                 suggestions.swap_remove(j);
                 return disambiguate(ident, suggestions);
-            } else if std_and_core(&ident, &suggestions[j], &suggestions[i]) {
+            } else if std_and_core(&suggestions[j], &suggestions[i]) {
                 suggestions.swap_remove(i);
                 return disambiguate(ident, suggestions);
             }
         }
     }
 
-    println!("\x1b[1;33m   Ambiguity\x1b[m for {ident}");
     // 1. prelude first
     // 2. stable over unstable
     // 3. more common (such as std::ops) over uncommon (like collection-specific things)
@@ -227,6 +255,7 @@ fn disambiguate(ident: String, mut suggestions: Vec<String>) -> (String, Vec<Str
     }
 
     use rand::prelude::*;
+    println!("\x1b[1;33m   Ambiguity\x1b[m for {ident}");
 
     for suggestion in &suggestions {
         println!("\x1b[1;31m            \x1b[m {suggestion}");
@@ -240,12 +269,10 @@ fn disambiguate(ident: String, mut suggestions: Vec<String>) -> (String, Vec<Str
 }
 
 #[allow(non_upper_case_globals)]
-fn std_and_core(ident: &str, a: &str, b: &str) -> bool {
+fn std_and_core(a: &str, b: &str) -> bool {
+    #[cfg(feature = "prefer_core")]
+    let (a, b) = (b, a);
     const std: &str = "std::";
     const core: &str = "core::";
-    let r = a.starts_with(std) && b.starts_with(core) && a[std.len()..] == b[core.len()..];
-    if r {
-        println!("\x1b[1;33m   Ambiguity\x1b[m for {ident}");
-    }
-    r
+    a.starts_with(std) && b.starts_with(core) && a[std.len()..] == b[core.len()..]
 }
